@@ -30,6 +30,9 @@ export function Neo() {
   const inferenceBusyRef = useRef(false);
   const lastCommitRef = useRef<{ label: string; at: number } | null>(null);
   const handPresenceRef = useRef(false);
+  const modeRef = useRef<NeoMode>('smart');
+  const alphabetReadyRef = useRef(false);
+  const wordReadyRef = useRef(false);
 
   const [mode, setMode] = useState<NeoMode>('smart');
   const [camera, setCamera] = useState<'idle' | 'starting' | 'ready' | 'error'>('idle');
@@ -47,6 +50,20 @@ export function Neo() {
   const [error, setError] = useState('');
   const [debug, setDebug] = useState(false);
   const { speak } = useTextToSpeech();
+
+  useEffect(() => {
+    modeRef.current = mode;
+    alphabetSequenceRef.current = [];
+    resetIslAlphabetClassifier();
+    resetNeoWordAdapter();
+    lastCommitRef.current = null;
+    setPrediction({
+      label: null,
+      confidence: 0,
+      stable: false,
+      kind: 'letter',
+    });
+  }, [mode]);
 
   const message = useMemo(
     () => tokens.map((token) => token.text).join(''),
@@ -92,60 +109,35 @@ export function Neo() {
     [tokens.length],
   );
 
-  const runAlphabet = useCallback(
-    async (next: NeoFrame) => {
-      const feature = buildAlphabetFeatureFrame(next.landmarks);
-      alphabetSequenceRef.current.push(feature);
+  const inferAlphabet = useCallback(async (next: NeoFrame): Promise<NeoPrediction | null> => {
+    const feature = buildAlphabetFeatureFrame(next.landmarks);
+    alphabetSequenceRef.current.push(feature);
 
-      if (alphabetSequenceRef.current.length > ALPHABET_SEQUENCE_LENGTH) {
-        alphabetSequenceRef.current.shift();
-      }
+    if (alphabetSequenceRef.current.length > ALPHABET_SEQUENCE_LENGTH) {
+      alphabetSequenceRef.current.shift();
+    }
 
-      if (alphabetSequenceRef.current.length < ALPHABET_SEQUENCE_LENGTH) return;
+    if (alphabetSequenceRef.current.length < ALPHABET_SEQUENCE_LENGTH) return null;
 
-      const result = await predictIslAlphabet(alphabetSequenceRef.current);
-      const nextPrediction: NeoPrediction = {
-        label: result.label,
-        confidence: result.confidence,
-        stable: result.stable,
-        kind: 'letter',
-      };
+    const result = await predictIslAlphabet(alphabetSequenceRef.current);
+    return {
+      label: result.label,
+      confidence: result.confidence,
+      stable: result.stable,
+      kind: 'letter',
+    };
+  }, []);
 
-      setPrediction(nextPrediction);
-      setActiveRecognizer('alphabet');
-
-      if (result.stable && result.label) {
-        commit(result.label, 'letter', result.confidence);
-      }
-    },
-    [commit],
-  );
-
-  const runWords = useCallback(
-    async (next: NeoFrame) => {
-      const result = await predictNeoWord(next);
-
-      if (!result) return;
-
-      setPrediction(result);
-      setActiveRecognizer('words');
-
-      if (result.stable && result.label) {
-        commit(result.label, 'word', result.confidence);
-      }
-    },
-    [commit],
-  );
+  const inferWords = useCallback(async (next: NeoFrame): Promise<NeoPrediction | null> => {
+    return predictNeoWord(next);
+  }, []);
 
   const handleFrame = useCallback(
     async (next: NeoFrame) => {
       setFrame(next);
 
-      const present = next.handsDetected > 0;
-      if (!present) {
-        if (handPresenceRef.current) {
-          clearRecognitionState();
-        }
+      if (next.handsDetected === 0) {
+        if (handPresenceRef.current) clearRecognitionState();
         handPresenceRef.current = false;
         setActiveRecognizer('none');
         return;
@@ -157,33 +149,71 @@ export function Neo() {
       inferenceBusyRef.current = true;
 
       try {
-        const useWords =
-          (mode === 'words' || mode === 'smart') && wordModelReady;
-        const useAlphabet =
-          mode === 'alphabet' ||
-          (mode === 'smart' && !wordModelReady);
+        const currentMode = modeRef.current;
+        const canUseWords = wordReadyRef.current;
+        const canUseAlphabet = alphabetReadyRef.current;
 
-        if (useWords) {
-          await runWords(next);
-        } else if (useAlphabet && alphabetModelReady) {
-          await runAlphabet(next);
-        } else {
-          setActiveRecognizer('none');
+        if (currentMode === 'alphabet' && canUseAlphabet) {
+          const result = await inferAlphabet(next);
+          if (result) {
+            setPrediction(result);
+            setActiveRecognizer('alphabet');
+            if (result.stable && result.label) {
+              commit(result.label, 'letter', result.confidence);
+            }
+          }
+          return;
         }
+
+        if (currentMode === 'words' && canUseWords) {
+          const result = await inferWords(next);
+          if (result) {
+            setPrediction(result);
+            setActiveRecognizer('words');
+            if (result.stable && result.label) {
+              commit(result.label, 'word', result.confidence);
+            }
+          }
+          return;
+        }
+
+        if (currentMode === 'smart') {
+          const wordResult = canUseWords ? await inferWords(next) : null;
+          const alphabetResult = canUseAlphabet ? await inferAlphabet(next) : null;
+
+          const selected =
+            wordResult?.stable && wordResult.label
+              ? wordResult
+              : alphabetResult?.stable && alphabetResult.label
+                ? alphabetResult
+                : wordResult ?? alphabetResult;
+
+          if (!selected) {
+            setActiveRecognizer('none');
+            return;
+          }
+
+          setPrediction(selected);
+          setActiveRecognizer(selected.kind === 'word' ? 'words' : 'alphabet');
+
+          if (selected.stable && selected.label) {
+            commit(
+              selected.label,
+              selected.kind,
+              selected.confidence,
+            );
+          }
+          return;
+        }
+
+        setActiveRecognizer('none');
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : 'Vision inference failed.');
       } finally {
         inferenceBusyRef.current = false;
       }
     },
-    [
-      alphabetModelReady,
-      clearRecognitionState,
-      mode,
-      runAlphabet,
-      runWords,
-      wordModelReady,
-    ],
+    [clearRecognitionState, commit, inferAlphabet, inferWords],
   );
 
   const start = useCallback(async () => {
@@ -198,20 +228,17 @@ export function Neo() {
 
     try {
       let loadedAlphabet = false;
-
       try {
         await loadIslAlphabetClassifier();
         loadedAlphabet = true;
-      } catch (cause) {
-        setError(
-          cause instanceof Error
-            ? 'Alphabet model unavailable: ' + cause.message
-            : 'Alphabet model unavailable.',
-        );
+      } catch {
+        loadedAlphabet = false;
       }
 
       const loadedWords = await loadNeoWordAdapter();
 
+      alphabetReadyRef.current = loadedAlphabet;
+      wordReadyRef.current = loadedWords;
       setAlphabetModelReady(loadedAlphabet);
       setWordModelReady(loadedWords);
 
@@ -236,16 +263,16 @@ export function Neo() {
     engineRef.current = null;
     clearRecognitionState();
     handPresenceRef.current = false;
+    alphabetReadyRef.current = false;
+    wordReadyRef.current = false;
+    setAlphabetModelReady(false);
+    setWordModelReady(false);
     setFrame(null);
     setCamera('idle');
     setActiveRecognizer('none');
   }, [clearRecognitionState]);
 
   useEffect(() => () => stop(), [stop]);
-
-  useEffect(() => {
-    clearRecognitionState();
-  }, [clearRecognitionState, mode]);
 
   const addManual = (value: string) => {
     setTokens((current) => [
